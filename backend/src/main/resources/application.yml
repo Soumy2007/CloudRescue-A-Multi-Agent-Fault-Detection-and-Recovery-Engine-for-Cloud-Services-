@@ -1,0 +1,46 @@
+spring:
+  application:
+    name: cloudrescue
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/cloudrescue}
+    username: ${DB_USER:cloudrescue}
+    password: ${DB_PASSWORD:cloudrescue}
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  flyway:
+    enabled: true
+  jackson:
+    time-zone: UTC
+    serialization:
+      write-dates-as-timestamps: false
+
+server:
+  port: 8080
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+
+cloudrescue:
+  # Fault injection must stay disabled outside dev/test environments.
+  fault-injection-enabled: ${FAULT_INJECTION_ENABLED:true}
+  workers:
+    enabled: ${WORKERS_ENABLED:true}
+  simulation:
+    seed: ${SIMULATION_SEED:42}
+  monitor:
+    poll-interval-ms: ${MONITOR_POLL_MS:1000}
+    probe-timeout-ms: 1000
+  recovery:
+    tick-ms: ${RECOVERY_TICK_MS:1000}
+    default-policy: ${DEFAULT_POLICY:COST_AWARE}
+  idempotency:
+    stale-after-ms: 10000

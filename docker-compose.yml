@@ -1,0 +1,45 @@
+# Run everything:  docker compose up --build
+#   Dashboard  http://localhost:3000
+#   API        http://localhost:8080/api/services
+#   Swagger    http://localhost:8080/swagger-ui.html
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cloudrescue}
+      POSTGRES_USER: ${POSTGRES_USER:-cloudrescue}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cloudrescue}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cloudrescue} -d ${POSTGRES_DB:-cloudrescue}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ./backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://db:5432/${POSTGRES_DB:-cloudrescue}
+      DB_USER: ${POSTGRES_USER:-cloudrescue}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-cloudrescue}
+      FAULT_INJECTION_ENABLED: ${FAULT_INJECTION_ENABLED:-true}
+      DEFAULT_POLICY: ${DEFAULT_POLICY:-COST_AWARE}
+      SIMULATION_SEED: ${SIMULATION_SEED:-42}
+    ports:
+      - "8081:8080"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  pgdata:
