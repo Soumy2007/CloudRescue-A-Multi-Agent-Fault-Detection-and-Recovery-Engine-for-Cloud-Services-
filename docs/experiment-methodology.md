@@ -25,6 +25,7 @@ It is a model, not real infrastructure.
 * Action durations are assumptions: retry 1 s, restart 5 s, failover 8 s, plus 1 s verification.
 * Results report sample count `n` and sample standard deviation. Recovery time is `n/a`, never 0, when nothing recovered.
 * Same seed and settings reproduce identical results.
+* A trial counts as recovered only if the last action itself succeeded AND three verification probes pass; a failed action is never credited with a recovery because a later probe happened to pass (Phase 2 rule).
 
 ## Scenarios
 
@@ -44,8 +45,8 @@ simulation results under the assumptions above, not evidence about real cloud sy
 | CRASH_RESTART_ALWAYS_FAILS | COST_AWARE | 100% | 27.0 | 0.903 | 7.1 |
 | REGION_OUTAGE | EXPONENTIAL_BACKOFF | 0% | n/a | 0.500 | 2.4 |
 | REGION_OUTAGE | COST_AWARE | 100% | 9.0 | 0.963 | 5.0 |
-| TRANSIENT_ERRORS | FIXED_RETRY | 100% | 16.4 | 0.950 | 0.3 |
-| TRANSIENT_ERRORS | COST_AWARE | 100% | 15.9 | 0.950 | 0.9 |
+| TRANSIENT_ERRORS | FIXED_RETRY | 100% | 17.6 | 0.950 | 0.3 |
+| TRANSIENT_ERRORS | COST_AWARE | 100% | 17.5 | 0.950 | 1.4 |
 
 Reading it fairly: `COST_AWARE` recovers more often and faster here, but spends more per incident on failover; for
 short transient faults the cheap retry-only policy is just as good. Idempotency check (`CRASH_LOST_ACKS`, `COST_AWARE`,

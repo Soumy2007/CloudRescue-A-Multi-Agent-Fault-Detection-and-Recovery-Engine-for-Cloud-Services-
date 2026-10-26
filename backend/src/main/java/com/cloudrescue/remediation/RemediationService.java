@@ -18,15 +18,19 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.HexFormat;
-import java.util.Optional;
 
-/** Executes retry / restart / failover. All side effects go through the idempotency module. */
+/**
+ * Executes retry / restart / failover and verifies the result. All side effects go through the idempotency
+ * module. Decision logic lives in the policies; this class never chooses WHAT to do, only does it and checks it.
+ */
 @Service
 public class RemediationService {
     private static final int MAX_ATTEMPTS = 3;
     private static final int VERIFY_PROBES = 3;
 
     public record ExecutionResult(boolean actionOk, String message, int attempts) {}
+
+    public record Verification(VerificationOutcome outcome, boolean observedHealthy, Long observedActiveNodeId) {}
 
     private final ServiceNodeRepository nodes;
     private final SimulatorService simulator;
@@ -51,17 +55,34 @@ public class RemediationService {
         return "inc-" + incidentId + "-act-" + seqNo;
     }
 
+    /**
+     * Fixes which node the action targets and which node must be serving afterwards. Runs once, before the first
+     * execution; a resumed or replayed action keeps its stored targets, so the idempotency request hash is stable.
+     */
+    public void prepare(Incident inc, RemediationAction a) {
+        if (a.targetNodeId != null) return;
+        ServiceNode active = nodes.findByServiceNameAndActiveTrue(inc.serviceName).orElseThrow();
+        a.targetNodeId = active.id;
+        a.expectedActiveNodeId = active.id;
+        if (a.actionType == ActionType.FAILOVER) {
+            nodes.findFirstByServiceNameAndActiveFalse(inc.serviceName).ifPresent(b -> a.expectedActiveNodeId = b.id);
+        }
+    }
+
     public ExecutionResult execute(Incident inc, RemediationAction action) {
-        String hash = sha256(action.actionType + "|" + inc.id + "|" + inc.serviceName + "|" + action.seqNo);
+        if (action.targetNodeId == null) {
+            throw new IllegalStateException("prepare() must run before execute()");
+        }
+        String hash = sha256(action.actionType + "|" + inc.id + "|" + inc.serviceName + "|" + action.seqNo
+                + "|" + action.targetNodeId + "|" + action.expectedActiveNodeId);
         for (int attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
             try {
                 var outcome = idempotency.execute(action.idempotencyKey, hash,
-                        () -> perform(action.actionType, inc, action.idempotencyKey).toStored(),
+                        () -> perform(action, action.idempotencyKey).toStored(),
                         simulator::effectResult);
                 ActionResult r = ActionResult.fromStored(outcome.result());
                 if (r.success() && action.actionType == ActionType.RESTART) {
-                    nodes.findByServiceNameAndActiveTrue(inc.serviceName)
-                            .ifPresent(n -> faults.endProcessFaultsOnNode(n.id, "RESTART"));
+                    faults.endProcessFaultsOnNode(action.targetNodeId, "RESTART");
                 }
                 return new ExecutionResult(r.success(),
                         r.message() + (outcome.replayed() ? " (replayed stored result)" : ""), attempt);
@@ -73,48 +94,91 @@ public class RemediationService {
         return new ExecutionResult(false, "Outcome still uncertain after " + MAX_ATTEMPTS + " attempts", MAX_ATTEMPTS);
     }
 
-    private ActionResult perform(ActionType type, Incident inc, String key) {
-        ServiceNode active = nodes.findByServiceNameAndActiveTrue(inc.serviceName).orElseThrow();
-        return switch (type) {
-            case RETRY -> {
-                HealthResult h = simulator.probe(active, probeTimeoutMs);
-                yield h.ok() ? ActionResult.ok("health check passed (" + h.latencyMs() + "ms)")
-                        : ActionResult.fail("health check failed (HTTP " + h.status() + ")");
-            }
-            case RESTART -> simulator.restart(active, key);
-            case FAILOVER -> failover(active, key);
-            default -> ActionResult.fail("Not an executable action: " + type);
+    private ActionResult perform(RemediationAction a, String key) {
+        ServiceNode target = nodes.findById(a.targetNodeId).orElseThrow();
+        return switch (a.actionType) {
+            case RETRY -> retry(target);
+            case RESTART -> restart(target, key);
+            case FAILOVER -> failover(a, target, key);
+            default -> ActionResult.fail("Not an executable action: " + a.actionType);
         };
     }
 
-    private ActionResult failover(ServiceNode current, String key) {
-        Optional<ServiceNode> backup = nodes.findFirstByServiceNameAndActiveFalse(current.serviceName);
-        if (backup.isEmpty()) return ActionResult.fail("no backup node exists");
-        ServiceNode b = backup.get();
-        HealthResult h = simulator.probe(b, probeTimeoutMs);
-        if (!h.ok()) return ActionResult.fail("backup in region " + b.region + " is unhealthy; failover rejected");
-        tx.executeWithoutResult(s -> {
-            ServiceNode cur = nodes.findById(current.id).orElseThrow();
-            ServiceNode bak = nodes.findById(b.id).orElseThrow();
+    private static String label(ServiceNode n) {
+        return n.serviceName + "@" + n.region;
+    }
+
+    private ActionResult retry(ServiceNode target) {
+        if (!target.active) {
+            return ActionResult.fail("precondition failed: " + label(target) + " is no longer serving traffic");
+        }
+        HealthResult h = simulator.probe(target, probeTimeoutMs);
+        return h.ok() ? ActionResult.ok("health check passed (" + h.latencyMs() + "ms)")
+                : ActionResult.fail("health check failed (HTTP " + h.status() + ")");
+    }
+
+    /** A process restart can only fix process-level faults; the simulator refuses it while the region is down. */
+    private ActionResult restart(ServiceNode target, String key) {
+        if (!target.active) {
+            return ActionResult.fail("precondition failed: " + label(target) + " is no longer serving traffic");
+        }
+        return simulator.restart(target, key);
+    }
+
+    private ActionResult failover(RemediationAction a, ServiceNode source, String key) {
+        ServiceNode backup = nodes.findById(a.expectedActiveNodeId).orElseThrow();
+        if (backup.id.equals(source.id)) {
+            return ActionResult.fail("no backup node exists");
+        }
+        if (backup.active && !source.active) {
+            return ActionResult.ok("traffic already on " + label(backup) + " (idempotent no-op)");
+        }
+        if (!source.active) {
+            return ActionResult.fail("precondition failed: " + label(source) + " is no longer serving traffic");
+        }
+        HealthResult h = simulator.probe(backup, probeTimeoutMs);
+        if (!h.ok()) {
+            return ActionResult.fail("backup in region " + backup.region + " is unhealthy; failover rejected");
+        }
+        Boolean switched = tx.execute(s -> {
+            ServiceNode cur = nodes.findById(source.id).orElseThrow();
+            ServiceNode bak = nodes.findById(backup.id).orElseThrow();
+            if (!cur.active || bak.active) return false;      // changed concurrently: do nothing
             cur.active = false;
+            nodes.saveAndFlush(cur);                          // flush order: never two active nodes at once
             bak.active = true;
-            nodes.save(cur);
-            nodes.save(bak);
+            nodes.saveAndFlush(bak);
+            return true;
         });
-        String msg = "traffic for " + current.serviceName + " moved to region " + b.region + " (simulated)";
+        if (!Boolean.TRUE.equals(switched)) {
+            return ActionResult.fail("precondition failed: node roles changed concurrently");
+        }
+        String msg = "traffic for " + source.serviceName + " moved to region " + backup.region + " (simulated)";
         simulator.recordEffect(key, "OK:" + msg);
-        simulator.maybeLoseAck(current.id, key);
+        simulator.maybeLoseAck(source.id, key);
         return ActionResult.ok(msg);
     }
 
-    /** Recovery verification: several consecutive healthy probes of the node now serving traffic. */
-    public boolean verify(String serviceName) {
-        ServiceNode active = nodes.findByServiceNameAndActiveTrue(serviceName).orElse(null);
-        if (active == null) return false;
-        for (int i = 0; i < VERIFY_PROBES; i++) {
-            if (!simulator.probe(active, probeTimeoutMs).ok()) return false;
+    /**
+     * Verifies the EXPECTED post-state, not merely "something answers": the node that must be serving traffic is
+     * the one serving, it is healthy over several probes, and the action itself succeeded.
+     */
+    public Verification verify(Incident inc, RemediationAction a, boolean actionOk) {
+        ServiceNode active = nodes.findByServiceNameAndActiveTrue(inc.serviceName).orElse(null);
+        boolean healthy = false;
+        if (active != null) {
+            healthy = true;
+            for (int i = 0; i < VERIFY_PROBES; i++) {
+                if (!simulator.probe(active, probeTimeoutMs).ok()) {
+                    healthy = false;
+                    break;
+                }
+            }
         }
-        return true;
+        Long observed = active == null ? null : active.id;
+        return new Verification(
+                RecoveryRules.evaluate(new RecoveryRules.Observation(actionOk, a.expectedActiveNodeId, observed, healthy)),
+                healthy, observed);
     }
 
     private static String sha256(String s) {

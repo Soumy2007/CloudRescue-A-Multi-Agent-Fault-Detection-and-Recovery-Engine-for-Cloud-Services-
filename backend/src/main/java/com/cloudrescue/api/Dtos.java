@@ -26,7 +26,7 @@ public final class Dtos {
         public static IncidentDto of(Incident i) {
             return new IncidentDto(i.id, i.serviceName, i.failureType.name(), i.state.name(), i.policyName,
                     i.detectedAt, i.recoveredAt,
-                     i.recoveredAt == null || i.epoch > 0 ? null : Duration.between(i.detectedAt, i.recoveredAt).toMillis() / 1000.0,
+                    i.recoveredAt == null || i.epoch > 0 ? null : Duration.between(i.detectedAt, i.recoveredAt).toMillis() / 1000.0,
                     i.faultInjectionId, i.epoch, i.summary);
         }
     }
@@ -39,10 +39,11 @@ public final class Dtos {
 
     public record ActionDto(Long id, int seqNo, String type, String status, String idempotencyKey, Instant scheduledAt,
                             Instant startedAt, Instant finishedAt, Long durationMs, int attempts, String result,
-                            Boolean verifiedHealthy) {
+                            Boolean verifiedHealthy, String outcome, Long targetNodeId, Long expectedActiveNodeId) {
         public static ActionDto of(RemediationAction a) {
             return new ActionDto(a.id, a.seqNo, a.actionType.name(), a.status.name(), a.idempotencyKey, a.scheduledAt,
-                    a.startedAt, a.finishedAt, a.durationMs, a.attempts, a.resultMessage, a.verifiedHealthy);
+                    a.startedAt, a.finishedAt, a.durationMs, a.attempts, a.resultMessage, a.verifiedHealthy,
+                    a.outcome == null ? null : a.outcome.name(), a.targetNodeId, a.expectedActiveNodeId);
         }
     }
 

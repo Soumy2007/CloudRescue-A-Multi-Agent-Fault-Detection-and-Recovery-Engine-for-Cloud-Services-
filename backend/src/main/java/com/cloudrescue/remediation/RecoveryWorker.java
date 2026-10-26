@@ -4,6 +4,7 @@ import com.cloudrescue.incident.Incident;
 import com.cloudrescue.incident.IncidentRepository;
 import com.cloudrescue.incident.IncidentService;
 import com.cloudrescue.incident.IncidentState;
+import com.cloudrescue.common.Errors.NotFoundException;
 import com.cloudrescue.monitor.MonitorService;
 import com.cloudrescue.common.Errors.ConflictException;
 import com.cloudrescue.policy.ActionType;
@@ -18,6 +19,8 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -44,10 +47,11 @@ public class RecoveryWorker {
     private final MonitorService monitor;
     private final Clock clock;
     private final boolean enabled;
+    private final TransactionTemplate tx;
 
     public RecoveryWorker(IncidentRepository incidentRepo, IncidentService incidents, RemediationActionRepository actions,
                           PolicyRunRepository policyRuns, PolicyRegistry policies, RemediationService remediation,
-                          MonitorService monitor, Clock clock,
+                          MonitorService monitor, Clock clock, PlatformTransactionManager txManager,
                           @Value("${cloudrescue.workers.enabled:true}") boolean enabled) {
         this.incidentRepo = incidentRepo;
         this.incidents = incidents;
@@ -58,6 +62,7 @@ public class RecoveryWorker {
         this.monitor = monitor;
         this.clock = clock;
         this.enabled = enabled;
+        this.tx = new TransactionTemplate(txManager);
     }
 
     @Scheduled(fixedDelayString = "${cloudrescue.recovery.tick-ms:1000}")
@@ -75,13 +80,16 @@ public class RecoveryWorker {
     }
 
     void step(long id) {
-        Incident inc = incidents.get(id);
-        switch (inc.state) {
-            case DETECTED -> incidents.transition(id, IncidentState.DETECTED, IncidentState.ANALYZING, "Analysis started");
-            case ANALYZING -> analyze(inc);
-            case REMEDIATING -> remediate(inc);
-            default -> { }
-        }
+        tx.executeWithoutResult(status -> {
+            Incident inc = incidentRepo.findByIdForUpdate(id)
+                    .orElseThrow(() -> new NotFoundException("Incident " + id + " not found"));
+            switch (inc.state) {
+                case DETECTED -> incidents.transition(id, IncidentState.DETECTED, IncidentState.ANALYZING, "Analysis started");
+                case ANALYZING -> analyze(inc);
+                case REMEDIATING -> remediate(inc);
+                default -> { }
+            }
+        });
     }
 
     private void analyze(Incident inc) {
@@ -135,28 +143,36 @@ public class RecoveryWorker {
         RemediationAction a = open.get();
         Instant now = clock.instant();
         if (a.status == ActionStatus.PENDING && a.scheduledAt.isAfter(now)) return; // backoff delay not elapsed
+
+        remediation.prepare(inc, a);                 // fix target + expected post-state once, before executing
         a.status = ActionStatus.RUNNING;
         if (a.startedAt == null) a.startedAt = now;
-        actions.save(a);
+        a = actions.saveAndFlush(a);                 // claim before side effects; optimistic lock rejects stale workers
 
         RemediationService.ExecutionResult r = remediation.execute(inc, a);
-        boolean healthy = remediation.verify(inc.serviceName);
+        RemediationService.Verification v = remediation.verify(inc, a, r.actionOk());
 
         a.status = r.actionOk() ? ActionStatus.SUCCEEDED : ActionStatus.FAILED;
         a.finishedAt = clock.instant();
         a.durationMs = Duration.between(a.startedAt, a.finishedAt).toMillis();
         a.attempts = r.attempts();
         a.resultMessage = r.message().length() > 480 ? r.message().substring(0, 480) : r.message();
-        a.verifiedHealthy = healthy;
-        actions.save(a);
+        a.outcome = v.outcome();
+        a.verifiedHealthy = v.outcome() == VerificationOutcome.VERIFIED;
+        a = actions.saveAndFlush(a);
 
-        if (healthy) {
-            monitor.clearHistory(inc.serviceName); // before RECOVERED so stale failures cannot reopen an incident
-            incidents.transition(inc.id, IncidentState.REMEDIATING, IncidentState.RECOVERED,
-                    "Verified healthy after " + a.actionType);
-        } else {
-            incidents.transition(inc.id, IncidentState.REMEDIATING, IncidentState.ANALYZING,
-                    a.actionType + " did not restore health; re-analyzing");
+        // Recovery needs a successful action AND the expected node serving and healthy. A failed action never
+        // recovers an incident, even if a later probe happens to pass.
+        switch (v.outcome()) {
+            case VERIFIED -> {
+                monitor.clearHistory(inc.serviceName); // before RECOVERED so stale failures cannot reopen an incident
+                incidents.transition(inc.id, IncidentState.REMEDIATING, IncidentState.RECOVERED,
+                        "Verified: " + a.actionType + " succeeded and the expected node is serving and healthy");
+            }
+            case ACTION_FAILED -> incidents.transition(inc.id, IncidentState.REMEDIATING, IncidentState.ANALYZING,
+                    a.actionType + " failed (" + a.resultMessage + "); not recovered, re-analyzing");
+            case POSTCONDITION_FAILED -> incidents.transition(inc.id, IncidentState.REMEDIATING, IncidentState.ANALYZING,
+                    a.actionType + " reported success but the expected state was not observed; re-analyzing");
         }
     }
 

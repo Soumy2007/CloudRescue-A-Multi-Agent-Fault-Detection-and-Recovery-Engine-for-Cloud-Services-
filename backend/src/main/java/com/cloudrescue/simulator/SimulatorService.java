@@ -110,6 +110,11 @@ public class SimulatorService {
         return Optional.ofNullable(effects.get(key));
     }
 
+    /** How many times the effect for this operation key was applied (should be 0 or 1). */
+    public int effectCount(String key) {
+        return effectCounts.getOrDefault(key, 0);
+    }
+
     /** Number of effects applied more than once for the same operation key (should stay 0). */
     public int duplicateEffects() {
         return effectCounts.values().stream().mapToInt(c -> Math.max(0, c - 1)).sum();

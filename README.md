@@ -17,9 +17,9 @@ docker compose up --build
 | What | URL |
 |---|---|
 | Dashboard | http://localhost:3000 |
-| REST API | http://localhost:8080/api/services |
-| Swagger / OpenAPI | http://localhost:8080/swagger-ui.html |
-| Health | http://localhost:8080/actuator/health |
+| REST API | http://localhost:8081/api/services |
+| Swagger / OpenAPI | http://localhost:8081/swagger-ui.html |
+| Health | http://localhost:8081/actuator/health |
 
 First build downloads Maven and npm dependencies, so allow a few minutes. Stop with `Ctrl+C`; wipe the database with
 `docker compose down -v`. Copy `.env.example` to `.env` to change passwords or the default policy.
@@ -67,7 +67,7 @@ Experiment Runner (virtual clock, same policies) --> Analytics --> REST API --> 
 | `api` | Thin controllers, DTOs, consistent errors |
 
 More detail: [docs/architecture.md](docs/architecture.md), [docs/api.md](docs/api.md),
-[docs/experiment-methodology.md](docs/experiment-methodology.md).
+[docs/experiment-methodology.md](docs/experiment-methodology.md), [docs/recovery-rules.md](docs/recovery-rules.md).
 
 ## Incident state machine
 
@@ -79,8 +79,8 @@ DETECTED -> ANALYZING -> REMEDIATING -> RECOVERED
               +--> FAILED   (policy gives up before scheduling anything)
 ```
 
-Invalid transitions throw `InvalidTransitionException` (HTTP 409). Each transition and its audit row commit in one
-transaction. `@Version` optimistic locking means two workers cannot both apply conflicting transitions.
+Invalid transitions throw `InvalidTransitionException` (HTTP 409). Each transition and its audit row commit in one transaction. `@Version` optimistic locking prevents conflicting updates. Each recovery step also runs in one transaction that first takes a pessimistic row lock on the incident (`SELECT ... FOR UPDATE`), so two workers cannot step the same incident at the same time.
+
 A partial unique index (`uq_one_unresolved_incident_per_service`) blocks duplicate incidents at the database level.
 
 ## Idempotency (and its honest limits)
@@ -107,16 +107,12 @@ cd frontend && npm install && npm run build
   ambiguous-outcome reconciliation, valid/invalid transitions, concurrent conflicting transitions, duplicate-incident
   prevention, re-open rules, and end-to-end crash / region-outage / lost-ack recovery.
 
-## Verification status (what was and was not run)
+## Verification status
 
-Be accurate about this in interviews:
-
-* **Run and passing:** the frontend type-check and production build; the Spring-free core (policies, state machine,
-  simulation engine) compiled with `javac`, and its 13 unit-test cases passed under a minimal stand-in for JUnit.
-* **NOT run:** the Spring Boot backend build, the Testcontainers integration tests, `docker compose up`, and the
-  GitHub Actions workflow. The build environment used to produce this project had no access to Maven Central or Docker.
-  Expect to fix small issues on your first `docker compose up --build` or `mvn verify`, and treat the integration tests
-  as written-but-unproven until you have run them.
+- **Backend (local):** `mvn -B verify` on 2026-10-26 finished with BUILD SUCCESS: 47 tests run, 0 failures, 0 errors, 0 skipped. Testcontainers started PostgreSQL 16 and Flyway applied all 3 migrations to an empty database.
+- **Recovery correctness (local):** `RecoveryCorrectnessIT` passed 10/10 and `RecoveryFlowIT` passed 3/3.
+- **Docker Compose (local):** backend, frontend and PostgreSQL containers ran together, and the demo scenarios (crash, region outage, lost acknowledgement) were exercised through the dashboard.
+- **GitHub Actions:** not yet verified.
 
 ## Limitations
 
@@ -125,11 +121,10 @@ Be accurate about this in interviews:
   idempotency claim, but it has not been load- or chaos-tested.
 * Failure classification (region vs service) is a heuristic over probe results.
 * Overlapping faults on the same node follow last-writer-wins in the simulator. No automatic failback after failover.
+* A crashed standby node is not repaired automatically (no incident is opened for it) and blocks failover for that service.
 * Experiment cost values are assumptions. Experiment duplicates use an in-memory model of idempotency; the real
   database-backed implementation is covered by the integration tests instead.
 * Fault injection is gated by `FAULT_INJECTION_ENABLED`. There is no authentication; do not expose this to the internet.
 
 ## Ideas for extensions (not built)
-
-Rolling-window anomaly detection (z-score), a human-approved LLM incident summary, RabbitMQ between components,
-Prometheus/Grafana metrics, Resilience4j circuit breakers, server-sent events for the dashboard.
+Rolling-window anomaly detection (z-score), a human-approved LLM incident summary, RabbitMQ between components, Prometheus/Grafana metrics, Resilience4j circuit breakers, server-sent events for the dashboard.

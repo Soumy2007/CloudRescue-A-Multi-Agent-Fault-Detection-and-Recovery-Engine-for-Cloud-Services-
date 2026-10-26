@@ -57,4 +57,16 @@ class SimulationEngineTest {
         var r = SimulationEngine.run(scenario("SERVICE_CRASH"), new CostAwarePolicy(), 3, true);
         assertEquals(2.0, r.detectionDelaySec());   // fault at t=30, 3rd failed probe at t=32
     }
+
+    @Test
+    void failedActionIsNotCreditedWithRecoveryWhenALaterProbePasses() {
+        // Fault ends at t=37. The first retry (completes t=36) fails; verification at t=37 sees a healthy node.
+        // The failed retry must not be credited: recovery comes from the SECOND retry (t=42, verified t=43).
+        Scenario s = new Scenario("EXPIRES_DURING_RETRY", "", SimulationEngine.FaultKind.LATENCY_SPIKE,
+                30, 7, 0, 0.0, 0.0, true, 300);
+        var r = SimulationEngine.run(s, new FixedRetryPolicy(), 1, true);
+        assertTrue(r.recovered());
+        assertEquals(2, r.retries());
+        assertEquals(11.0, r.recoveryTimeSec());     // 43 - 32 (old behaviour would report 5.0)
+    }
 }

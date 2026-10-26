@@ -8,25 +8,25 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.testcontainers.containers.PostgreSQLContainer;
 
 /** One PostgreSQL container shared by all integration tests (singleton pattern, safe with Spring's context cache). */
-abstract class PostgresIT {
-    static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:16-alpine");
+public abstract class PostgresIT {
+    public static final PostgreSQLContainer<?> PG = new PostgreSQLContainer<>("postgres:16-alpine");
 
     static {
         PG.start();
     }
 
     @DynamicPropertySource
-    static void props(DynamicPropertyRegistry r) {
+    public static void props(DynamicPropertyRegistry r) {
         r.add("spring.datasource.url", PG::getJdbcUrl);
         r.add("spring.datasource.username", PG::getUsername);
         r.add("spring.datasource.password", PG::getPassword);
     }
 
     @Autowired
-    JdbcTemplate jdbc;
+    protected JdbcTemplate jdbc;
 
     @BeforeEach
-    void cleanDatabase() {
+    protected void cleanDatabase() {
         jdbc.execute("DELETE FROM policy_runs");
         jdbc.execute("DELETE FROM remediation_actions");
         jdbc.execute("DELETE FROM incident_state_transitions");
