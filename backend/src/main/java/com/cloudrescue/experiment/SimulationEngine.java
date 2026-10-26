@@ -128,6 +128,7 @@ public final class SimulationEngine {
             int detectedAt = -1, recoveredAt = -1, actionEnd = 0, verifyAt = 0;
             double cost = 0;
             boolean escalated = false;
+            boolean actionOk = false;     // did the last executed action itself succeed?
             ActionType pending = null;
             FailureType ftype = classify(sc.kind());
 
@@ -158,7 +159,10 @@ public final class SimulationEngine {
                 } else if (phase == Phase.ACTING && t >= actionEnd) {
                     boolean applied = false;
                     switch (pending) {
-                        case RETRY -> retries++;
+                        case RETRY -> {
+                            retries++;
+                            actionOk = probe(t);   // a retry succeeds only if the health check passes
+                        }
                         case RESTART -> {
                             restarts++;
                             boolean regionDown = sc.kind() == FaultKind.REGION_OUTAGE && faultActive(t);
@@ -176,6 +180,7 @@ public final class SimulationEngine {
                         }
                         default -> { }
                     }
+                    if (pending != ActionType.RETRY) actionOk = applied;
                     cost += CostModel.of(pending);
                     int extra = 0;
                     if (applied && rng.nextDouble() < sc.ackLossProb()) {
@@ -192,7 +197,9 @@ public final class SimulationEngine {
                 } else if (phase == Phase.VERIFYING && t >= verifyAt) {
                     boolean healthy = true;
                     for (int i = 0; i < VERIFY_PROBES; i++) healthy &= probe(t);
-                    if (healthy) {
+                    // Recovery needs a successful action AND healthy probes: a failed action is never
+                    // credited with a recovery just because a later probe happened to pass.
+                    if (healthy && actionOk) {
                         recoveredAt = t;
                         phase = Phase.DONE;
                     } else {
