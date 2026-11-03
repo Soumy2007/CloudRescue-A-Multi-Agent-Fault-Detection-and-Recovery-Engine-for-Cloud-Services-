@@ -11,6 +11,8 @@ import com.cloudrescue.remediation.RemediationActionRepository;
 import com.cloudrescue.simulator.ServiceNode;
 import com.cloudrescue.simulator.ServiceNodeRepository;
 import com.cloudrescue.simulator.SimulatorService;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.annotation.DirtiesContext;
@@ -36,10 +38,15 @@ class RecoveryFlowIT extends PostgresIT {
     @Autowired RemediationActionRepository actions;
     @Autowired ServiceNodeRepository nodes;
     @Autowired SimulatorService simulator;
+    @Autowired MeterRegistry registry;
 
     @AfterEach
     void resetFaults() {
         faults.reset();
+    }
+
+    private double detectedIncidents() {
+        return registry.find("cloudrescue.incidents.detected").counters().stream().mapToDouble(Counter::count).sum();
     }
 
     private ServiceNode primary(String service) {
@@ -63,6 +70,7 @@ class RecoveryFlowIT extends PostgresIT {
         List<RemediationAction> as = actions.findByIncidentIdOrderBySeqNoAsc(i.id);
         assertTrue(as.stream().anyMatch(a -> a.actionType.name().equals("RESTART") && Boolean.TRUE.equals(a.verifiedHealthy)));
         assertEquals(0, simulator.duplicateEffects());
+        assertTrue(detectedIncidents() >= 1, "the detection was counted by cloudrescue.incidents.detected");
     }
 
     @Test
@@ -73,6 +81,9 @@ class RecoveryFlowIT extends PostgresIT {
         for (String s : List.of("payment-service", "order-service", "auth-service")) {
             assertEquals("B", nodes.findByServiceNameAndActiveTrue(s).orElseThrow().region);
         }
+        double ratio = registry.get("cloudrescue.service.availability.ratio").tag("service", "payment-service")
+                .gauge().value();
+        assertTrue(ratio < 1.0, "the outage must stay visible in the availability ratio, was " + ratio);
     }
 
     @Test

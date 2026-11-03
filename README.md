@@ -15,10 +15,13 @@ docker compose up --build
 ```
 
 | What | URL |
-|---|---|
+
 | Dashboard | http://localhost:3000 |
+
 | REST API | http://localhost:8081/api/services |
+
 | Swagger / OpenAPI | http://localhost:8081/swagger-ui.html |
+
 | Health | http://localhost:8081/actuator/health |
 
 First build downloads Maven and npm dependencies, so allow a few minutes. Stop with `Ctrl+C`; wipe the database with
@@ -41,7 +44,6 @@ First build downloads Maven and npm dependencies, so allow a few minutes. Stop w
 
 ## Architecture (modular monolith)
 
-```
 Fault Injector -> Simulator (Region A / B nodes)
                        | probes
                  Monitor -- 3 of last 5 probes failed --> Incident Manager (state machine, PostgreSQL)
@@ -51,10 +53,9 @@ Fault Injector -> Simulator (Region A / B nodes)
                                                                                     v
                                                           verify (3 probes) --> RECOVERED / re-analyze / FAILED / ESCALATED
 Experiment Runner (virtual clock, same policies) --> Analytics --> REST API --> React dashboard
-```
 
 | Package | Responsibility |
-|---|---|
+
 | `simulator` | In-memory nodes, health probes, restart, effect log |
 | `fault` | Fault injection records, expiry, reset, dev/test gate |
 | `monitor` | Polling, rolling window detection, failure classification |
@@ -71,13 +72,11 @@ More detail: [docs/architecture.md](docs/architecture.md), [docs/api.md](docs/ap
 
 ## Incident state machine
 
-```
 DETECTED -> ANALYZING -> REMEDIATING -> RECOVERED
               |  ^           |  |
               |  +-----------+  +--> FAILED  --(operator re-open)--> ANALYZING
               +--> ESCALATED --(operator re-open)--> ANALYZING
               +--> FAILED   (policy gives up before scheduling anything)
-```
 
 Invalid transitions throw `InvalidTransitionException` (HTTP 409). Each transition and its audit row commit in one transaction. `@Version` optimistic locking prevents conflicting updates. Each recovery step also runs in one transaction that first takes a pessimistic row lock on the incident (`SELECT ... FOR UPDATE`), so two workers cannot step the same incident at the same time.
 
@@ -109,10 +108,19 @@ cd frontend && npm install && npm run build
 
 ## Verification status
 
-- **Backend (local):** `mvn -B verify` on 2026-10-26 finished with BUILD SUCCESS: 47 tests run, 0 failures, 0 errors, 0 skipped. Testcontainers started PostgreSQL 16 and Flyway applied all 3 migrations to an empty database.
-- **Recovery correctness (local):** `RecoveryCorrectnessIT` passed 10/10 and `RecoveryFlowIT` passed 3/3.
-- **Docker Compose (local):** backend, frontend and PostgreSQL containers ran together, and the demo scenarios (crash, region outage, lost acknowledgement) were exercised through the dashboard.
-- **GitHub Actions:** not yet verified.
+**Backend (local):** `mvn -B clean verify` on 2026-11-03: 91 tests, 0 failures, 0 errors, 0 skipped. BUILD SUCCESS. Testcontainers integration tests included.
+
+**Recovery correctness (local):** `RecoveryCorrectnessIT` passed 10/10 and `RecoveryFlowIT` passed 3/3.
+
+**Observability (local):** Actuator health returned `UP`; custom CloudRescue metrics were verified at `/actuator/prometheus`.
+
+**Auto-reopen (local):** `IncidentAutoReopenIT` passed 5/5. A live test confirmed that the same FAILED incident re-opened with an incremented epoch and a new fault ID, without creating a duplicate incident. The subsequent FIXED_RETRY recovery attempt failed, so successful recovery after re-opening is not claimed.
+
+ **Docker Compose (local):** Backend, frontend and PostgreSQL containers ran together. Crash recovery and region-outage failover were exercised.
+
+**Optional monitoring stack:** Prometheus/Grafana configuration and dashboard JSON are present but have not been runtime-verified.
+
+**GitHub Actions:** not yet verified.
 
 ## Limitations
 
@@ -127,4 +135,37 @@ cd frontend && npm install && npm run build
 * Fault injection is gated by `FAULT_INJECTION_ENABLED`. There is no authentication; do not expose this to the internet.
 
 ## Ideas for extensions (not built)
-Rolling-window anomaly detection (z-score), a human-approved LLM incident summary, RabbitMQ between components, Prometheus/Grafana metrics, Resilience4j circuit breakers, server-sent events for the dashboard.
+
+Rolling-window anomaly detection (z-score), a human-approved LLM incident summary, RabbitMQ between components, Prometheus alerting rules and Alertmanager, distributed tracing, Resilience4j circuit breakers, server-sent events for the dashboard.
+
+## Observability and monitoring
+
+CloudRescue exposes Prometheus metrics, structured logs, and an **Observability** dashboard tab. All measurements describe the
+**simulated** services and regions, not real infrastructure.
+
+| What | URL |
+
+| Prometheus metrics | http://localhost:8081/actuator/prometheus |
+
+| Health | http://localhost:8081/actuator/health |
+
+| Dashboard summary API | http://localhost:8081/api/observability/summary |
+
+| Dashboard tab | http://localhost:3000 (Observability) |
+
+future work such as:
+-Alerting rules and Alertmanager
+
+ -Distributed tracing
+
+ -Authentication and authorization
+
+-Persisted availability history
+
+```powershell
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up --build -d
+```
+
+Metric definitions, log events, PromQL examples, failure behavior and limitations are in
+[docs/observability.md](docs/observability.md); the design is in [docs/observability-plan.md](docs/observability-plan.md).
+Actuator endpoints have no authentication: do not expose the backend port to untrusted networks.

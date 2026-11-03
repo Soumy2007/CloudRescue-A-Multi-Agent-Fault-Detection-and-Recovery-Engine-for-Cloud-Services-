@@ -23,7 +23,19 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        # Only what observability needs. Not exposed: env, beans, heapdump, loggers, ...
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: never
+  metrics:
+    tags:
+      application: cloudrescue
+
+logging:
+  pattern:
+    # incident_id / service come from the MDC while the recovery worker handles an incident ("-" otherwise).
+    level: "%5p [inc=%X{incident_id:--} svc=%X{service:--}]"
 
 springdoc:
   swagger-ui:
@@ -40,7 +52,14 @@ cloudrescue:
     poll-interval-ms: ${MONITOR_POLL_MS:1000}
     probe-timeout-ms: 1000
   recovery:
+    # A FAILED/ESCALATED incident is re-opened when its service fails again, after min-age, while epoch < max-epoch.
+    auto-reopen:
+      min-age-ms: ${AUTO_REOPEN_MIN_AGE_MS:30000}
+      max-epoch: ${AUTO_REOPEN_MAX_EPOCH:3}
     tick-ms: ${RECOVERY_TICK_MS:1000}
     default-policy: ${DEFAULT_POLICY:COST_AWARE}
   idempotency:
     stale-after-ms: 10000
+  observability:
+    # Monitor polls kept per service for cloudrescue_service_availability_ratio (about window x poll interval seconds)
+    availability-window: ${AVAILABILITY_WINDOW:300}

@@ -2,9 +2,13 @@ package com.cloudrescue.fault;
 
 import com.cloudrescue.common.Errors.BadRequestException;
 import com.cloudrescue.common.Errors.ForbiddenException;
+import com.cloudrescue.observability.AfterCommit;
+import com.cloudrescue.observability.EventLog;
 import com.cloudrescue.simulator.ServiceNode;
 import com.cloudrescue.simulator.ServiceNodeRepository;
 import com.cloudrescue.simulator.SimulatorService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
 import org.springframework.context.event.EventListener;
@@ -20,6 +24,7 @@ import java.util.Set;
 
 @Service
 public class FaultService {
+    private static final Logger log = LoggerFactory.getLogger(FaultService.class);
     private static final Set<FaultType> PROCESS_FAULTS = EnumSet.of(FaultType.CRASH, FaultType.LATENCY, FaultType.ERROR_RATE);
     private static final Set<FaultType> OUTAGE_FAULTS = EnumSet.of(FaultType.CRASH, FaultType.LATENCY, FaultType.ERROR_RATE, FaultType.REGION_OUTAGE);
 
@@ -66,6 +71,8 @@ public class FaultService {
         f.scheduledEndAt = durationSec != null ? now.plusSeconds(durationSec) : null;
         repo.save(f);
         simulator.apply(type, f.targetNodeId, f.targetRegion, f.severity);
+        AfterCommit.run(() -> EventLog.info(log, "fault.injected", "fault_id", f.id, "fault_type", f.faultType,
+                "node_id", f.targetNodeId, "region", f.targetRegion, "severity", f.severity, "duration_s", durationSec));
         return f;
     }
 
@@ -108,6 +115,8 @@ public class FaultService {
         f.endedAt = clock.instant();
         f.endReason = reason;
         simulator.clear(f.faultType, f.targetNodeId, f.targetRegion);
+        AfterCommit.run(() -> EventLog.info(log, "fault.ended", "fault_id", f.id, "fault_type", f.faultType,
+                "node_id", f.targetNodeId, "region", f.targetRegion, "reason", reason));
     }
 
     /** Re-applies still-active faults after a restart of the application. */
