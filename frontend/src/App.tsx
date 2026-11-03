@@ -2,8 +2,9 @@ import { useState } from 'react'
 import Overview from './components/Overview'
 import Incidents from './components/Incidents'
 import Experiments from './components/Experiments'
+import Observability from './components/Observability'
 
-const TABS = ['Overview', 'Incidents', 'Experiments'] as const
+const TABS = ['Overview', 'Incidents', 'Observability', 'Experiments'] as const
 type Tab = (typeof TABS)[number]
 
 export default function App() {
@@ -29,6 +30,7 @@ export default function App() {
       <main>
         {tab === 'Overview' && <Overview onOpenIncident={(id) => { setFocusIncident(id); setTab('Incidents') }} />}
         {tab === 'Incidents' && <Incidents focusId={focusIncident} />}
+        {tab === 'Observability' && <Observability />}
         {tab === 'Experiments' && <Experiments />}
       </main>
       <footer className="foot">All regions, services and failures are simulated. Times are UTC. Cost values are assumptions, not measurements.</footer>

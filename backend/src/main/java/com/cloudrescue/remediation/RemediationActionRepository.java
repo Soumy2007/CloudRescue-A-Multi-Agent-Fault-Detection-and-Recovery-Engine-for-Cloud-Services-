@@ -12,4 +12,9 @@ public interface RemediationActionRepository extends JpaRepository<RemediationAc
     Optional<RemediationAction> findFirstByIncidentIdAndStatusInOrderBySeqNoDesc(Long incidentId, Collection<ActionStatus> s);
     long countByIncidentId(Long incidentId);
     long countByIncidentIdAndEpochAndActionTypeAndStatusIn(Long incidentId, int epoch, ActionType type, Collection<ActionStatus> s);
+
+    /** Durable verification counts for the observability summary. */
+    long countByOutcome(VerificationOutcome outcome);
+
+    long countByStatus(ActionStatus status);
 }

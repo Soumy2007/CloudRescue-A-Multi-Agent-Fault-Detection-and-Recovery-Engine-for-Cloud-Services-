@@ -2,17 +2,23 @@ package com.cloudrescue.incident;
 
 import com.cloudrescue.common.Errors.InvalidTransitionException;
 import com.cloudrescue.common.Errors.NotFoundException;
+import com.cloudrescue.observability.AfterCommit;
+import com.cloudrescue.observability.EventLog;
 import com.cloudrescue.policy.ActionType;
 import com.cloudrescue.policy.FailureType;
 import com.cloudrescue.simulator.ServiceNode;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
+import java.util.Optional;
 
 /**
  * Owns incident persistence and the state machine. Every transition and its audit row are written in one
@@ -20,6 +26,8 @@ import java.util.List;
  */
 @Service
 public class IncidentService {
+    private static final Logger log = LoggerFactory.getLogger(IncidentService.class);
+
     private final IncidentRepository incidents;
     private final IncidentTransitionRepository transitions;
     private final Clock clock;
@@ -73,6 +81,68 @@ public class IncidentService {
         return i;
     }
 
+    /**
+     * Re-opens a FAILED or ESCALATED incident because the service is failing again. Without this, the one-unresolved-
+     * incident-per-service rule would let an old failed incident block recovery of every later failure.
+     *
+     * Bounded on purpose: only after the incident has sat in its final state for {@code minAge}, and only while
+     * {@code epoch < maxEpoch} (operator re-opens count too), so a service that can never be repaired is not retried
+     * forever. The incident adopts the CURRENT policy and the freshly observed failure type, and it still has to pass
+     * the normal verified-recovery rules to reach RECOVERED.
+     */
+      // Edit in this method to add a new parameter for the new fault ID 3/11/2026
+    @Transactional
+public Optional<Incident> reopenIfStale(
+        long id,
+        String policyName,
+        FailureType failureType,
+        Long newFaultId,
+        Duration minAge,
+        int maxEpoch) {
+
+    Incident i = get(id);
+
+    if (i.state != IncidentState.FAILED &&
+            i.state != IncidentState.ESCALATED) {
+        return Optional.empty();
+    }
+
+    // Require a genuinely new active fault.
+    if (newFaultId == null || newFaultId.equals(i.faultInjectionId)) {
+        return Optional.empty();
+    }
+
+    if (i.epoch >= maxEpoch) {
+        return Optional.empty();
+    }
+
+    List<IncidentTransition> history =
+            transitions.findByIncidentIdOrderByIdAsc(id);
+
+    Instant since = history.isEmpty()
+            ? i.detectedAt
+            : history.get(history.size() - 1).occurredAt;
+
+    if (Duration.between(since, clock.instant()).compareTo(minAge) < 0) {
+        return Optional.empty();
+    }
+
+    // Store the new fault ID.
+    i.faultInjectionId = newFaultId;
+    i.epoch++;
+    i.forcedAction = null;
+    i.policyName = policyName;
+    i.failureType = failureType;
+
+    apply(i, IncidentState.ANALYZING,
+            "Auto re-opened for new fault #" + newFaultId
+                    + " (policy " + policyName
+                    + ", failure " + failureType
+                    + ", epoch " + i.epoch + ")");
+
+    return Optional.of(i);
+}
+// edit end point 3/11/2026
     @Transactional
     public void consumeForcedAction(long id) {
         Incident i = get(id);
@@ -93,6 +163,13 @@ public class IncidentService {
         }
         incidents.saveAndFlush(i);   // flush so an optimistic-lock conflict surfaces here
         transitions.save(new IncidentTransition(i.id, from, to, reason, now));
+
+        // Logged after commit so a rolled-back and re-run step does not produce a misleading duplicate line.
+        final Double recoverySec = to == IncidentState.RECOVERED
+                ? Duration.between(i.detectedAt, now).toMillis() / 1000.0 : null;
+        AfterCommit.run(() -> EventLog.info(log, "incident.transition",
+                "incident_id", i.id, "service", i.serviceName, "from", from, "to", to,
+                "epoch", i.epoch, "reason", reason, "recovery_duration_s", recoverySec));
     }
 
     @Transactional(readOnly = true)

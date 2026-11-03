@@ -1,0 +1,9 @@
+# Scrapes the CloudRescue backend over the Docker network. Used by docker-compose.monitoring.yml.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: cloudrescue
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["backend:8080"]

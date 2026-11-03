@@ -20,6 +20,9 @@ Interactive docs: `http://localhost:8080/swagger-ui.html`. Errors always use
 | `GET /api/experiments/{batchId}/summary` | Per-cell and overall statistics | |
 | `GET /api/analytics/live` | Live incident counts and policy stats | |
 | `GET /api/analytics/metrics` | Metric definitions | |
+| `GET /api/observability/summary` | Dashboard summary: counts by state, success rate, recovery duration, verification outcomes, simulated availability, recent incidents | Read-only; every value derived from PostgreSQL or the in-memory availability tracker |
+| `GET /actuator/prometheus` | Prometheus scrape endpoint | No authentication; see docs/observability.md |
+| `GET /actuator/health`, `/actuator/metrics` | Health and metric browser | No authentication |
 
 Fault body example:
 

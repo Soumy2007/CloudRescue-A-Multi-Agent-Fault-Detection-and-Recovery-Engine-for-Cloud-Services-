@@ -1,9 +1,13 @@
 package com.cloudrescue.monitor;
 
 import com.cloudrescue.fault.FaultService;
+import com.cloudrescue.incident.Incident;
 import com.cloudrescue.incident.IncidentRepository;
 import com.cloudrescue.incident.IncidentService;
 import com.cloudrescue.incident.IncidentState;
+import com.cloudrescue.observability.AvailabilityTracker;
+import com.cloudrescue.observability.EventLog;
+import com.cloudrescue.observability.RecoveryMetrics;
 import com.cloudrescue.policy.FailureType;
 import com.cloudrescue.policy.PolicyRegistry;
 import com.cloudrescue.simulator.HealthResult;
@@ -17,6 +21,7 @@ import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
@@ -46,10 +51,17 @@ public class MonitorService {
     private final PolicyRegistry policies;
     private final int probeTimeoutMs;
     private final boolean enabled;
+    private final AvailabilityTracker availability;
+    private final RecoveryMetrics metrics;
+    private final long autoReopenMinAgeMs;
+    private final int autoReopenMaxEpoch;
     private final Map<Long, Deque<Sample>> history = new HashMap<>();
 
     public MonitorService(ServiceNodeRepository nodes, SimulatorService simulator, IncidentService incidentService,
                           IncidentRepository incidentRepo, FaultService faultService, PolicyRegistry policies,
+                          AvailabilityTracker availability, RecoveryMetrics metrics,
+                          @Value("${cloudrescue.recovery.auto-reopen.min-age-ms:30000}") long autoReopenMinAgeMs,
+                          @Value("${cloudrescue.recovery.auto-reopen.max-epoch:3}") int autoReopenMaxEpoch,
                           @Value("${cloudrescue.monitor.probe-timeout-ms:1000}") int probeTimeoutMs,
                           @Value("${cloudrescue.workers.enabled:true}") boolean enabled) {
         this.nodes = nodes;
@@ -60,6 +72,10 @@ public class MonitorService {
         this.policies = policies;
         this.probeTimeoutMs = probeTimeoutMs;
         this.enabled = enabled;
+        this.availability = availability;
+        this.metrics = metrics;
+        this.autoReopenMinAgeMs = autoReopenMinAgeMs;
+        this.autoReopenMaxEpoch = autoReopenMaxEpoch;
     }
 
     @Scheduled(fixedDelayString = "${cloudrescue.monitor.poll-interval-ms:1000}")
@@ -72,21 +88,66 @@ public class MonitorService {
                 Deque<Sample> d = history.computeIfAbsent(n.id, k -> new ArrayDeque<>());
                 d.addLast(new Sample(r.ok(), r.latencyMs(), r.status()));
                 if (d.size() > HISTORY) d.removeFirst();
+                // Availability of the logical service = does the node SERVING traffic answer. Never cleared on recovery.
+                if (n.active) availability.record(n.serviceName, r.ok());
             }
         }
         for (ServiceNode n : all) {
             if (!n.active || failuresInWindow(n.id) < DETECT_FAILURES) continue;
-            if (incidentRepo.existsByServiceNameAndStateNot(n.serviceName, IncidentState.RECOVERED)) continue;
             FailureType type = classify(n, all);
+            if (incidentRepo.existsByServiceNameAndStateNot(n.serviceName, IncidentState.RECOVERED)) {
+                // An unresolved incident exists. If it is a stale FAILED/ESCALATED one, the service has failed again
+                // and nothing else would ever act on it, so give it another bounded recovery attempt.
+                tryAutoReopen(n, type);
+                continue;
+            }
             try {
-                incidentService.open(n, type, policies.active().name(), faultService.findActiveFaultId(n),
-                        "Detected " + type + " on " + n.serviceName + "@" + n.region);
-                log.info("Incident opened for {}@{} ({})", n.serviceName, n.region, type);
+                Incident created = incidentService.open(n, type, policies.active().name(),
+                        faultService.findActiveFaultId(n), "Detected " + type + " on " + n.serviceName + "@" + n.region);
+                // open() has committed here, so this counts exactly one detected incident.
+                metrics.incidentDetected(type);
+                EventLog.info(log, "incident.detected", "incident_id", created.id, "service", n.serviceName,
+                        "region", n.region, "failure_type", type, "policy", created.policyName,
+                        "fault_id", created.faultInjectionId);
             } catch (DataIntegrityViolationException e) {
                 log.debug("Incident for {} already open (unique index)", n.serviceName);
             }
         }
     }
+ // edit in 3/11/2024: Added tryAutoReopen() to handle reopening stale incidents when a service fails again.
+    private void tryAutoReopen(ServiceNode n, FailureType type) {
+    try {
+        Long activeFaultId = faultService.findActiveFaultId(n);
+
+        if (activeFaultId == null) {
+            return;
+        }
+
+        incidentRepo.findFirstByServiceNameAndStateNotOrderByIdDesc(
+                        n.serviceName, IncidentState.RECOVERED)
+                .flatMap(blocking -> incidentService.reopenIfStale(
+                        blocking.id,
+                        policies.active().name(),
+                        type,
+                        activeFaultId,
+                        Duration.ofMillis(autoReopenMinAgeMs),
+                        autoReopenMaxEpoch))
+                .ifPresent(reopened ->
+                        EventLog.info(log, "incident.auto_reopened",
+                                "incident_id", reopened.id,
+                                "service", n.serviceName,
+                                "region", n.region,
+                                "failure_type", type,
+                                "fault_id", activeFaultId,
+                                "policy", reopened.policyName,
+                                "epoch", reopened.epoch));
+
+    } catch (RuntimeException e) {
+        log.debug("Auto re-open skipped for {}: {}", n.serviceName, e.toString());
+    }
+}
+
+// upto this point 3/11/2026
 
     private synchronized int failuresInWindow(Long nodeId) {
         Deque<Sample> d = history.get(nodeId);
